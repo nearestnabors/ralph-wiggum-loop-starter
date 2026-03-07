@@ -69,6 +69,7 @@ All configuration is via environment variables:
 ### Step 0: Prerequisites
 
 - **macOS or Linux**
+- **Git** — for auto-commits after each task
 - **Node.js 22+** — `brew install node`
 - **Claude Code** — `npm install -g @anthropic-ai/claude-code`
 - **A Claude plan** — Max ($100-200/month) for daily use, Pro ($20/month) for overnight exploration runs

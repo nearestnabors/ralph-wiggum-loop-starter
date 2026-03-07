@@ -38,6 +38,11 @@ if ! command -v claude &> /dev/null; then
     exit 1
 fi
 
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "❌ Not inside a git repository. Ralph needs git for auto-commits."
+    exit 1
+fi
+
 UNCHECKED=$(grep -c -- '- \[ \]' "$PROJECT_DIR/implementation-plan.md" || true)
 
 if [ "$UNCHECKED" -eq 0 ]; then
@@ -82,11 +87,21 @@ while true; do
     fi
 
     # All remaining tasks have 3+ failure notes — stuck
-    UNCHECKED="$REMAINING"
-    STUCK=$(awk '/- \[ \]/{task=1; warns=0; next} task && /⚠️/{warns++} task && !/⚠️/{if(warns>=3) stuck++; task=0} END{print stuck+0}' "$PROJECT_DIR/implementation-plan.md")
+    STUCK=$(awk '
+        /- \[ \]/ {
+            if (warns >= 3) stuck++
+            warns = 0
+            next
+        }
+        /⚠️/ { warns++ }
+        END {
+            if (warns >= 3) stuck++
+            print stuck + 0
+        }
+    ' "$PROJECT_DIR/implementation-plan.md")
 
-    if [ "$STUCK" -ge "$UNCHECKED" ] && [ "$UNCHECKED" -gt 0 ]; then
-        echo "🚧 All $UNCHECKED remaining tasks have 3+ failures. Human intervention needed."
+    if [ "$STUCK" -ge "$REMAINING" ] && [ "$REMAINING" -gt 0 ]; then
+        echo "🚧 All $REMAINING remaining tasks have 3+ failures. Human intervention needed."
         echo "   Review implementation-plan.md for ⚠️ notes."
         break
     fi
@@ -96,7 +111,7 @@ while true; do
     TASKS_BEFORE=$(grep -c -- '- \[x\]' "$PROJECT_DIR/implementation-plan.md" 2>/dev/null || echo 0)
 
     echo "🤖 Running Claude Code (headless)..."
-    cd "$PROJECT_DIR"
+    cd "$PROJECT_DIR" || exit 1
 
     claude -p "$(cat prompt.md)" \
         --allowedTools "$ALLOWED_TOOLS" \
@@ -104,59 +119,58 @@ while true; do
 
     EXIT_CODE=${PIPESTATUS[0]}
 
-    # ── Handle errors ────────────────────────────────────────────────────
+    # ── Handle rate limits and errors ─────────────────────────────────────
 
-    if [ $EXIT_CODE -ne 0 ]; then
-        # Rate limit detection
-        if grep -q "hit your limit" "$LOG_FILE" 2>/dev/null; then
-            RESET_MSG=$(grep -o 'resets [0-9]*[ap]m' "$LOG_FILE" | head -1)
+    # Check for rate limit regardless of exit code
+    if grep -q "hit your limit" "$LOG_FILE" 2>/dev/null; then
+        RESET_MSG=$(grep -o 'resets [0-9]*[ap]m' "$LOG_FILE" | head -1)
 
-            if [ "$ON_LIMIT" = "stop" ]; then
-                echo "🛑 Rate limit hit. $RESET_MSG. Stopping (ON_LIMIT=stop)."
-                break
-            fi
-
-            # Calculate seconds until reset
-            if [ -n "$RESET_MSG" ]; then
-                RESET_HOUR=$(echo "$RESET_MSG" | grep -o '[0-9]*[ap]m')
-                HOUR_NUM=$(echo "$RESET_HOUR" | grep -o '[0-9]*')
-                if echo "$RESET_HOUR" | grep -q 'pm'; then
-                    [ "$HOUR_NUM" -ne 12 ] && HOUR_NUM=$((HOUR_NUM + 12))
-                else
-                    [ "$HOUR_NUM" -eq 12 ] && HOUR_NUM=0
-                fi
-                NOW_EPOCH=$(date +%s)
-                RESET_EPOCH=$(date -j -v"${HOUR_NUM}H" -v0M -v0S +%s 2>/dev/null || date -d "today ${HOUR_NUM}:00" +%s 2>/dev/null)
-                if [ "$RESET_EPOCH" -le "$NOW_EPOCH" ]; then
-                    RESET_EPOCH=$((RESET_EPOCH + 86400))
-                fi
-
-                # Overnight mode: stop if reset is after wake time
-                if [ "$ON_LIMIT" = "overnight" ]; then
-                    WAKE_EPOCH=$(date -j -v"${WAKE_HOUR}H" -v0M -v0S +%s 2>/dev/null || date -d "today ${WAKE_HOUR}:00" +%s 2>/dev/null)
-                    if [ "$WAKE_EPOCH" -le "$NOW_EPOCH" ]; then
-                        WAKE_EPOCH=$((WAKE_EPOCH + 86400))
-                    fi
-                    if [ "$RESET_EPOCH" -ge "$WAKE_EPOCH" ]; then
-                        echo "🌙 Rate limit hit. $RESET_MSG (after your ${WAKE_HOUR}:00 wake time). Stopping to preserve your morning tokens."
-                        echo "   Resume in the morning with: ./ralph.sh"
-                        break
-                    fi
-                fi
-
-                WAIT_SECS=$((RESET_EPOCH - NOW_EPOCH + 60))
-                WAIT_MINS=$((WAIT_SECS / 60))
-                echo "⏸️  Rate limit hit. $RESET_MSG. Sleeping ${WAIT_MINS} minutes until reset..."
-                sleep "$WAIT_SECS"
-            else
-                echo "⏸️  Rate limit hit. Couldn't parse reset time. Sleeping 30 minutes..."
-                sleep 1800
-            fi
-        else
-            echo "⚠️  Claude exited with code $EXIT_CODE. Check $LOG_FILE"
-            echo "   Waiting 30 seconds before retry..."
-            sleep 30
+        if [ "$ON_LIMIT" = "stop" ]; then
+            echo "🛑 Rate limit hit. $RESET_MSG. Stopping (ON_LIMIT=stop)."
+            break
         fi
+
+        # Calculate seconds until reset
+        if [ -n "$RESET_MSG" ]; then
+            RESET_HOUR=$(echo "$RESET_MSG" | grep -o '[0-9]*[ap]m')
+            HOUR_NUM=$(echo "$RESET_HOUR" | grep -o '[0-9]*')
+            if echo "$RESET_HOUR" | grep -q 'pm'; then
+                [ "$HOUR_NUM" -ne 12 ] && HOUR_NUM=$((HOUR_NUM + 12))
+            else
+                [ "$HOUR_NUM" -eq 12 ] && HOUR_NUM=0
+            fi
+            NOW_EPOCH=$(date +%s)
+            RESET_EPOCH=$(date -j -v"${HOUR_NUM}H" -v0M -v0S +%s 2>/dev/null || date -d "today ${HOUR_NUM}:00" +%s 2>/dev/null)
+            if [ "$RESET_EPOCH" -le "$NOW_EPOCH" ]; then
+                RESET_EPOCH=$((RESET_EPOCH + 86400))
+            fi
+
+            # Overnight mode: stop if reset is after wake time
+            if [ "$ON_LIMIT" = "overnight" ]; then
+                WAKE_EPOCH=$(date -j -v"${WAKE_HOUR}H" -v0M -v0S +%s 2>/dev/null || date -d "today ${WAKE_HOUR}:00" +%s 2>/dev/null)
+                if [ "$WAKE_EPOCH" -le "$NOW_EPOCH" ]; then
+                    WAKE_EPOCH=$((WAKE_EPOCH + 86400))
+                fi
+                if [ "$RESET_EPOCH" -ge "$WAKE_EPOCH" ]; then
+                    echo "🌙 Rate limit hit. $RESET_MSG (after your ${WAKE_HOUR}:00 wake time). Stopping to preserve your morning tokens."
+                    echo "   Resume in the morning with: ./ralph.sh"
+                    break
+                fi
+            fi
+
+            WAIT_SECS=$((RESET_EPOCH - NOW_EPOCH + 60))
+            WAIT_MINS=$((WAIT_SECS / 60))
+            echo "⏸️  Rate limit hit. $RESET_MSG. Sleeping ${WAIT_MINS} minutes until reset..."
+            sleep "$WAIT_SECS"
+        else
+            echo "⏸️  Rate limit hit. Couldn't parse reset time. Sleeping 30 minutes..."
+            sleep 1800
+        fi
+        continue
+    elif [ "$EXIT_CODE" -ne 0 ]; then
+        echo "⚠️  Claude exited with code $EXIT_CODE. Check $LOG_FILE"
+        echo "   Waiting 30 seconds before retry..."
+        sleep 30
         continue
     fi
 
@@ -166,7 +180,12 @@ while true; do
 
     if [ "$TASKS_AFTER" -gt "$TASKS_BEFORE" ]; then
         COMPLETED_TASK=$(diff <(git show HEAD:implementation-plan.md 2>/dev/null || echo "") implementation-plan.md \
-            | grep '^\+.*\[x\]' | head -1 | sed 's/^+- \[x\] //' || echo "task $ITERATION")
+            | grep '^\+[^+].*\[x\]' | head -1)
+        # Remove diff prefix and checkbox with optional indentation
+        COMPLETED_TASK="${COMPLETED_TASK#+}"
+        COMPLETED_TASK="${COMPLETED_TASK#"${COMPLETED_TASK%%[![:space:]]*}"}"
+        COMPLETED_TASK="${COMPLETED_TASK#- \[x\] }"
+        COMPLETED_TASK="${COMPLETED_TASK:-task $ITERATION}"
 
         git add -A
         git commit -m "ralph #${ITERATION}: ${COMPLETED_TASK}" --no-verify
